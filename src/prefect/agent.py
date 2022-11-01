@@ -31,6 +31,7 @@ class OrionAgent:
         default_infrastructure: Infrastructure = None,
         default_infrastructure_document_id: UUID = None,
         limit: Optional[int] = None,
+        add_tags: List[str] = None,
     ) -> None:
 
         if default_infrastructure and default_infrastructure_document_id:
@@ -46,6 +47,7 @@ class OrionAgent:
         self.task_group: Optional[anyio.abc.TaskGroup] = None
         self.limit: Optional[int] = limit
         self.limiter: Optional[anyio.CapacityLimiter] = None
+        self.add_tags = add_tags
         self.client: Optional[OrionClient] = None
 
         self.work_queue_prefix = work_queue_prefix
@@ -261,6 +263,10 @@ class OrionAgent:
         limiter: Optional[anyio.CapacityLimiter],
         task_status: anyio.abc.TaskStatus = None,
     ) -> Union[InfrastructureResult, Exception]:
+        if self.add_tags:
+            for tag in self.add_tags:
+                flow_run.tags.append(tag)
+            await self.client.update_flow_run(flow_run.id, tags=flow_run.tags)
 
         # Note: There is not a clear way to determine if task_status.started() has been
         #       called without peeking at the internal `_future`. Ideally we could just
