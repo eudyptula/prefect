@@ -2,6 +2,7 @@
 The agent is responsible for checking for flow runs that are ready to run and starting
 their execution.
 """
+import platform
 from typing import Iterator, List, Optional, Set, Union
 from uuid import UUID
 
@@ -29,6 +30,8 @@ class OrionAgent:
         prefetch_seconds: int = None,
         default_infrastructure: Infrastructure = None,
         default_infrastructure_document_id: UUID = None,
+        limit: Optional[int] = None,
+        add_tags: List[str] = None,
     ) -> None:
 
         if default_infrastructure and default_infrastructure_document_id:
@@ -42,6 +45,9 @@ class OrionAgent:
         self.started = False
         self.logger = get_logger("agent")
         self.task_group: Optional[anyio.abc.TaskGroup] = None
+        self.limit: Optional[int] = limit
+        self.limiter: Optional[anyio.CapacityLimiter] = None
+        self.add_tags = add_tags
         self.client: Optional[OrionClient] = None
 
         self.work_queue_prefix = work_queue_prefix
@@ -161,17 +167,25 @@ class OrionAgent:
                     self.logger.exception(exc)
 
         for flow_run in submittable_runs:
-            self.logger.info(f"Submitting flow run '{flow_run.id}'")
 
             # don't resubmit a run
             if flow_run.id in self.submitting_flow_run_ids:
                 continue
 
-            self.submitting_flow_run_ids.add(flow_run.id)
-            self.task_group.start_soon(
-                self.submit_run,
-                flow_run,
-            )
+            try:
+                if self.limiter:
+                    self.limiter.acquire_on_behalf_of_nowait(flow_run.id)
+            except anyio.WouldBlock:
+                self.logger.info(f"Flow run limit reached'")
+                break
+            else:
+                self.logger.info(f"Submitting flow run '{flow_run.id}'")
+                self.submitting_flow_run_ids.add(flow_run.id)
+                self.task_group.start_soon(
+                    self.submit_run,
+                    flow_run,
+                    self.limiter,
+                )
 
         return submittable_runs
 
@@ -216,7 +230,7 @@ class OrionAgent:
         prepared_infrastructure = infrastructure_block.prepare_for_flow_run(flow_run)
         return prepared_infrastructure
 
-    async def submit_run(self, flow_run: FlowRun) -> None:
+    async def submit_run(self, flow_run: FlowRun, limiter: Optional[anyio.CapacityLimiter]) -> None:
         """
         Submit a flow run to the infrastructure
         """
@@ -230,11 +244,13 @@ class OrionAgent:
                     f"Failed to get infrastructure for flow run '{flow_run.id}'."
                 )
                 await self._propose_failed_state(flow_run, exc)
+                if limiter:
+                    limiter.release_on_behalf_of(flow_run.id)
             else:
                 # Wait for submission to be completed. Note that the submission function
                 # may continue to run in the background after this exits.
                 await self.task_group.start(
-                    self._submit_run_and_capture_errors, flow_run, infrastructure
+                    self._submit_run_and_capture_errors, flow_run, infrastructure, limiter
                 )
                 self.logger.info(f"Completed submission of flow run '{flow_run.id}'")
 
@@ -244,8 +260,13 @@ class OrionAgent:
         self,
         flow_run: FlowRun,
         infrastructure: Infrastructure,
+        limiter: Optional[anyio.CapacityLimiter],
         task_status: anyio.abc.TaskStatus = None,
     ) -> Union[InfrastructureResult, Exception]:
+        if self.add_tags:
+            for tag in self.add_tags:
+                flow_run.tags.append(tag)
+            await self.client.update_flow_run(flow_run.id, tags=flow_run.tags)
 
         # Note: There is not a clear way to determine if task_status.started() has been
         #       called without peeking at the internal `_future`. Ideally we could just
@@ -271,6 +292,9 @@ class OrionAgent:
                     "occurred."
                 )
             return exc
+        finally:
+            if limiter:
+                limiter.release_on_behalf_of(flow_run.id)
 
         if not task_status._future.done():
             self.logger.error(
@@ -334,6 +358,7 @@ class OrionAgent:
     async def start(self):
         self.started = True
         self.task_group = anyio.create_task_group()
+        self.limiter = anyio.CapacityLimiter(self.limit) if self.limit is not None else None
         self.client = get_client()
         await self.client.__aenter__()
         await self.task_group.__aenter__()
